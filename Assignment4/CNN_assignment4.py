@@ -1,210 +1,371 @@
-# -*- coding: utf-8 -*-
-"""CNN_week9.ipynb
-
-IST597 :- Implementing CNN from scratch
-Week 9 Tutorial
-
-Author:- aam35
-"""
+# CS 599 – DL: Normalization Assignment
+# Single CNN class with norm_type: "none", "batch", "layer", "weight"
 
 import tensorflow as tf
 import numpy as np
 import time
-import tensorflow.contrib.eager as tfe
-tf.enable_eager_execution()
-tf.executing_eagerly()
-seed = 1234
-tf.random.set_random_seed(seed=seed)
-np.random.seed(seed)
 
-from tensorflow.examples.tutorials.mnist import input_data
-data = input_data.read_data_sets("/tmp/data/", one_hot=True, reshape=False)
+# ----------------- Global config -----------------
+seed = 1234
+tf.random.set_seed(seed)
+np.random.seed(seed)
 
 batch_size = 64
 hidden_size = 100
 learning_rate = 0.01
-output_size = 10
+output_size = 10  # Fashion-MNIST has 10 classes
 
-class CNN(object):
-  def __init__(self,hidden_size,output_size,device=None):
-      filter_h, filter_w, filter_c , filter_n = 5 ,5 ,1 ,30
-      self.W1 = tf.Variable(tf.random_normal([filter_h, filter_w, filter_c, filter_n], stddev=0.1))
-      self.b1 = tf.Variable(tf.zeros([filter_n]),dtype=tf.float32)
-      self.W2 = tf.Variable(tf.random_normal([14*14*filter_n, hidden_size], stddev=0.1))
-      self.b2 = tf.Variable(tf.zeros([hidden_size]),dtype=tf.float32)
-      self.W3 = tf.Variable(tf.random_normal([hidden_size, output_size], stddev=0.1))
-      self.b3 = tf.Variable(tf.zeros([output_size]),dtype=tf.float32)
-      self.variables = [self.W1,self.b1, self.W2, self.b2, self.W3, self.b3]
-      self.device = device
-      self.size_output = output_size
-  
-  def flatten(self,X, window_h, window_w, window_c, out_h, out_w, stride=1, padding=0):
-    
-      X_padded = tf.pad(X, [[0,0], [padding, padding], [padding, padding], [0,0]])
 
-      windows = []
-      for y in range(out_h):
-          for x in range(out_w):
-              window = tf.slice(X_padded, [0, y*stride, x*stride, 0], [-1, window_h, window_w, -1])
-              windows.append(window)
-      stacked = tf.stack(windows) # shape : [out_h, out_w, n, filter_h, filter_w, c]
+# ----------------- Dataset: Fashion-MNIST -----------------
+def load_fashion_mnist(batch_size=64):
+    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.fashion_mnist.load_data()
+    x_train = x_train.astype("float32") / 255.0
+    x_test = x_test.astype("float32") / 255.0
 
-      return tf.reshape(stacked, [-1, window_c*window_w*window_h])
-  
-  def convolution(self,X, W, b, padding, stride):
-      n, h, w, c = map(lambda d: d.value, X.get_shape())
-      #print(X.get_shape())
-      #print(data.train.images.get_shape())
-      filter_h, filter_w, filter_c, filter_n = [d.value for d in W.get_shape()]
-    
-      out_h = (h + 2*padding - filter_h)//stride + 1
-      out_w = (w + 2*padding - filter_w)//stride + 1
+    # Add channel dimension: (B, 28, 28, 1)
+    x_train = x_train[..., tf.newaxis]
+    x_test = x_test[..., tf.newaxis]
 
-      X_flat = self.flatten(X, filter_h, filter_w, filter_c, out_h, out_w, stride, padding)
-      W_flat = tf.reshape(W, [filter_h*filter_w*filter_c, filter_n])
-    
-      z = tf.matmul(X_flat, W_flat) + b     # b: 1 X filter_n
-    
-      return tf.transpose(tf.reshape(z, [out_h, out_w, n, filter_n]), [2, 0, 1, 3])
-    
- 
-    
-  def relu(self,X):
-      return tf.maximum(X, tf.zeros_like(X))
-    
-  def max_pool(self,X, pool_h, pool_w, padding, stride):
-      n, h, w, c = [d.value for d in X.get_shape()]
-    
-      out_h = (h + 2*padding - pool_h)//stride + 1
-      out_w = (w + 2*padding - pool_w)//stride + 1
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices((x_train, y_train))
+        .shuffle(50000)
+        .batch(batch_size)
+    )
+    test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batch_size)
+    return train_ds, test_ds, (x_train, y_train), (x_test, y_test)
 
-      X_flat = self.flatten(X, pool_h, pool_w, c, out_h, out_w, stride, padding)
 
-      pool = tf.reduce_max(tf.reshape(X_flat, [out_h, out_w, n, pool_h*pool_w, c]), axis=3)
-      return tf.transpose(pool, [2, 0, 1, 3])
+# ----------------- Normalization functions (from scratch) -----------------
+def batch_norm(x, gamma, beta, eps=1e-5, training=True):
+    """
+    BatchNorm over (N, H, W) for each channel.
+    x: (B, H, W, C)
+    gamma, beta: (1, 1, 1, C)
+    """
+    axes = [0, 1, 2]
+    mean = tf.reduce_mean(x, axis=axes, keepdims=True)
+    var = tf.reduce_mean(tf.square(x - mean), axis=axes, keepdims=True)
+    x_hat = (x - mean) / tf.sqrt(var + eps)
+    return gamma * x_hat + beta
 
-    
-  def affine(self,X, W, b):
-      n = X.get_shape()[0].value # number of samples
-      X_flat = tf.reshape(X, [n, -1])
-      return tf.matmul(X_flat, W) + b 
-    
-  def softmax(self,X):
-      X_centered = X - tf.reduce_max(X) # to avoid overflow
-      X_exp = tf.exp(X_centered)
-      exp_sum = tf.reduce_sum(X_exp, axis=1)
-      return tf.transpose(tf.transpose(X_exp) / exp_sum) 
-    
-  
-  def cross_entropy_error(self,yhat, y):
-      return -tf.reduce_mean(tf.log(tf.reduce_sum(yhat * y, axis=1)))
-    
-  
-  def forward(self,X):
-      if self.device is not None:
-        with tf.device('gpu:0' if self.device == 'gpu' else 'cpu'):
-          self.y = self.compute_output(X)
-      else:
-        self.y = self.compute_output(X)
-      
-      return self.y
-    
-    
-  def loss(self, y_pred, y_true):
-      '''
-      y_pred - Tensor of shape (batch_size, size_output)
-      y_true - Tensor of shape (batch_size, size_output)
-      '''
-      y_true_tf = tf.cast(tf.reshape(y_true, (-1, self.size_output)), dtype=tf.float32)
-      y_pred_tf = tf.cast(y_pred, dtype=tf.float32)
-      return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits=y_pred_tf, labels=y_true_tf))
-    
-    
-  def backward(self, X_train, y_train):
-      """
-      backward pass
-      """
-      # optimizer
-      # Test with SGD,Adam, RMSProp
-      optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
-      #predicted = self.forward(X_train)
-      #current_loss = self.loss(predicted, y_train)
-      #optimizer.minimize(current_loss, self.variables)
 
-      #optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-      with tf.GradientTape() as tape:
-          predicted = self.forward(X_train)
-          current_loss = self.loss(predicted, y_train)
-      #print(predicted)
-      #print(current_loss)
-      #current_loss_tf = tf.cast(current_loss, dtype=tf.float32)
-      grads = tape.gradient(current_loss, self.variables)
-      optimizer.apply_gradients(zip(grads, self.variables),
-                              global_step=tf.train.get_or_create_global_step())
-      
-      
-  def compute_output(self,X):
-      conv_layer1 = self.convolution(X, self.W1, self.b1, padding=2, stride=1)
-      conv_activation = self.relu(conv_layer1)
-      conv_pool = self.max_pool(conv_activation, pool_h=2, pool_w=2, padding=0, stride=2)
-      conv_affine =self.affine(conv_pool, self.W2,self.b2)
-      conv_affine_activation = self.relu(conv_affine)
-      
-      conv_affine_1 = self.affine(conv_affine_activation, self.W3, self.b3)
-      return conv_affine_1
+def layer_norm(x, gamma, beta, eps=1e-5):
+    """
+    LayerNorm over (H, W, C) for each example.
+    x: (B, H, W, C)
+    gamma, beta: (1, 1, 1, C)
+    """
+    axes = [1, 2, 3]
+    mean = tf.reduce_mean(x, axis=axes, keepdims=True)
+    var = tf.reduce_mean(tf.square(x - mean), axis=axes, keepdims=True)
+    x_hat = (x - mean) / tf.sqrt(var + eps)
+    return gamma * x_hat + beta
 
-def accuracy_function(yhat,true_y):
-  correct_prediction = tf.equal(tf.argmax(yhat, 1), tf.argmax(true_y, 1))
-  accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-  return accuracy
 
-# Initialize model using GPU
-mlp_on_cpu = CNN(hidden_size,output_size, device='gpu')
+class WeightNormDense(tf.keras.layers.Layer):
+    """
+    Fully-connected layer with Weight Normalization:
+    w = g * v / ||v||
+    """
 
-num_epochs = 4
-train_x =  tf.convert_to_tensor(data.train.images)
-train_y = tf.convert_to_tensor(data.train.labels)
-time_start = time.time()
-num_train = 55000
-z= 0
+    def __init__(self, in_dim, out_dim, activation=None, name=None):
+        super().__init__(name=name)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.activation = activation
 
-for epoch in range(num_epochs):
-        train_ds = tf.data.Dataset.from_tensor_slices((data.train.images, data.train.labels)).map(lambda x, y: (x, tf.cast(y, tf.float32)))\
-           .shuffle(buffer_size=1000)\
-           .batch(batch_size=batch_size)
-        loss_total = tf.Variable(0, dtype=tf.float32)
-        accuracy_total = tf.Variable(0, dtype=tf.float32)
-        for inputs, outputs in train_ds:
-            preds = mlp_on_cpu.forward(inputs)
-            loss_total = loss_total + mlp_on_cpu.loss(preds, outputs)
-#             accuracy_train = accuracy_function(preds,outputs)
-#             accuracy_total = accuracy_total + accuracy_train
-            mlp_on_cpu.backward(inputs, outputs)
-            #print(z)
-            #z = z+ 1
-        print('Number of Epoch = {} - loss:= {:.4f}'.format(epoch + 1, loss_total.numpy() / num_train))
-        preds = mlp_on_cpu.compute_output(train_x)
-        accuracy_train = accuracy_function(preds,train_y)
-        
-        accuracy_train = accuracy_train * 100
-        print ("Training Accuracy = {}".format(accuracy_train.numpy()))
-        
-        
-#         preds_val = mlp_on_cpu.compute_output(data.validation.images)
-#         accuracy_val = accuracy_function(preds_val,data.validation.labels)
-#         accuracy_val = accuracy_val * 100
-#         print ("Validation Accuracy = {}".format(accuracy_val.numpy()))
- 
-#test accuracy
-test_x =  tf.convert_to_tensor(data.test.images)
-test_y = tf.convert_to_tensor(data.test.labels)
-preds_test = mlp_on_cpu.compute_output(test_x)
-accuracy_test = accuracy_function(preds_test,test_y)
-# To keep sizes compatible with model
-accuracy_test = accuracy_test * 100
-print ("Test Accuracy = {}".format(accuracy_test.numpy()))
+    def build(self, input_shape):
+        # v has same shape as a standard dense weight matrix
+        self.v = self.add_weight(
+            name="v",
+            shape=[self.in_dim, self.out_dim],
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
+            trainable=True,
+        )
+        self.g = self.add_weight(
+            name="g",
+            shape=[self.out_dim],
+            initializer=tf.keras.initializers.Ones(),
+            trainable=True,
+        )
+        self.b = self.add_weight(
+            name="bias",
+            shape=[self.out_dim],
+            initializer=tf.keras.initializers.Zeros(),
+            trainable=True,
+        )
 
-        
-# time_taken = time.time() - time_start
-# print('\nTotal time taken (in seconds): {:.2f}'.format(time_taken))
-# #For per epoch_time = Total_Time / Number_of_epochs
+    def call(self, x):
+        # x: (B, in_dim)
+        v_norm = tf.norm(self.v, axis=0)  # (out_dim,)
+        w = self.v * (self.g / (v_norm + 1e-8))
+        y = tf.matmul(x, w) + self.b
+        if self.activation is not None:
+            y = self.activation(y)
+        return y
+
+
+# ----------------- CNN model (Option A: norm_type switch) -----------------
+class CNN(tf.keras.Model):
+    """
+    Single CNN class.
+
+    norm_type:
+      - "none"  : no normalization
+      - "batch" : BatchNorm from scratch
+      - "layer" : LayerNorm from scratch
+      - "weight": WeightNorm on first FC layer
+    """
+
+    def __init__(self, hidden_size, output_size, norm_type="none", device=None, name=None):
+        super().__init__(name=name)
+        self.hidden_size = hidden_size
+        self.size_output = output_size
+        self.norm_type = norm_type
+        self.device = device
+
+        # Convolutional backbone (Keras conv + maxpool allowed)
+        self.conv1 = tf.keras.layers.Conv2D(
+            filters=32, kernel_size=3, padding="same", use_bias=False
+        )
+        self.conv2 = tf.keras.layers.Conv2D(
+            filters=64, kernel_size=3, padding="same", use_bias=False
+        )
+        self.pool = tf.keras.layers.MaxPool2D(pool_size=2, strides=2)
+        self.flatten_layer = tf.keras.layers.Flatten()
+
+        # Gamma/Beta for conv layers if BN or LN
+        if self.norm_type in ["batch", "layer"]:
+            self.gamma1 = tf.Variable(tf.ones([1, 1, 1, 32]), trainable=True, name="gamma1")
+            self.beta1  = tf.Variable(tf.zeros([1, 1, 1, 32]), trainable=True, name="beta1")
+
+            self.gamma2 = tf.Variable(tf.ones([1, 1, 1, 64]), trainable=True, name="gamma2")
+            self.beta2  = tf.Variable(tf.zeros([1, 1, 1, 64]), trainable=True, name="beta2")
+
+        # FC layers: WeightNorm on fc1 if norm_type == "weight"
+        fc_input_dim = 7 * 7 * 64  # 28x28 -> pool2 -> 7x7
+
+        if self.norm_type == "weight":
+            self.fc1 = WeightNormDense(
+                fc_input_dim, hidden_size, activation=tf.nn.relu, name="wn_fc1"
+            )
+        else:
+            self.fc1 = tf.keras.layers.Dense(hidden_size, activation=tf.nn.relu)
+
+        self.fc_out = tf.keras.layers.Dense(output_size, activation=None)
+
+        # Our own loss function
+        self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+    # -------- Legacy functions from your old file (kept but unused) --------
+    def flatten(self, X, window_h, window_w, window_c, out_h, out_w, stride=1, padding=0):
+        X_padded = tf.pad(X, [[0, 0], [padding, padding], [padding, padding], [0, 0]])
+        windows = []
+        for y in range(out_h):
+            for x in range(out_w):
+                window = tf.slice(
+                    X_padded,
+                    [0, y * stride, x * stride, 0],
+                    [-1, window_h, window_w, -1],
+                )
+                windows.append(window)
+        stacked = tf.stack(windows)
+        return tf.reshape(stacked, [-1, window_c * window_w * window_h])
+
+    def convolution(self, X, W, b, padding, stride):
+        # Legacy, not used in new forward
+        n, h, w, c = X.shape
+        filter_h, filter_w, filter_c, filter_n = W.shape
+        out_h = (h + 2 * padding - filter_h) // stride + 1
+        out_w = (w + 2 * padding - filter_w) // stride + 1
+        X_flat = self.flatten(X, filter_h, filter_w, filter_c, out_h, out_w, stride, padding)
+        W_flat = tf.reshape(W, [filter_h * filter_w * filter_c, filter_n])
+        z = tf.matmul(X_flat, W_flat) + b
+        return tf.transpose(tf.reshape(z, [out_h, out_w, n, filter_n]), [2, 0, 1, 3])
+
+    def relu(self, X):
+        return tf.maximum(X, tf.zeros_like(X))
+
+    def max_pool(self, X, pool_h, pool_w, padding, stride):
+        n, h, w, c = X.shape
+        out_h = (h + 2 * padding - pool_h) // stride + 1
+        out_w = (w + 2 * padding - pool_w) // stride + 1
+        X_flat = self.flatten(X, pool_h, pool_w, c, out_h, out_w, stride, padding)
+        pool = tf.reduce_max(tf.reshape(X_flat, [out_h, out_w, n, pool_h * pool_w, c]), axis=3)
+        return tf.transpose(pool, [2, 0, 1, 3])
+
+    def affine(self, X, W, b):
+        n = tf.shape(X)[0]
+        X_flat = tf.reshape(X, [n, -1])
+        return tf.matmul(X_flat, W) + b
+
+    def softmax(self, X):
+        X_centered = X - tf.reduce_max(X)
+        X_exp = tf.exp(X_centered)
+        exp_sum = tf.reduce_sum(X_exp, axis=1, keepdims=True)
+        return X_exp / exp_sum
+
+    def cross_entropy_error(self, yhat, y):
+        return -tf.reduce_mean(tf.math.log(tf.reduce_sum(yhat * y, axis=1)))
+
+    # ----------------- New forward / loss / backward -----------------
+    def _apply_norm(self, x, gamma, beta, training=True):
+        if self.norm_type == "batch":
+            return batch_norm(x, gamma, beta, training=training)
+        elif self.norm_type == "layer":
+            return layer_norm(x, gamma, beta)
+        else:
+            return x
+
+    def compute_output(self, X, training=True):
+        # X: (B, 28, 28, 1)
+        x = self.conv1(X)
+        if self.norm_type in ["batch", "layer"]:
+            x = self._apply_norm(x, self.gamma1, self.beta1, training=training)
+        x = tf.nn.relu(x)
+        x = self.pool(x)
+
+        # FIXED: pass x positionally, not as X=x
+        x = self.conv2(x)
+        if self.norm_type in ["batch", "layer"]:
+            x = self._apply_norm(x, self.gamma2, self.beta2, training=training)
+        x = tf.nn.relu(x)
+        x = self.pool(x)
+
+        x = self.flatten_layer(x)
+
+        if self.norm_type == "weight":
+            x = self.fc1(x)  # WeightNormDense already has activation
+        else:
+            x = self.fc1(x)
+
+        logits = self.fc_out(x)
+        return logits
+
+    def call(self, X, training=False):
+        # Keras uses call() for forward pass; __call__ wraps this automatically
+        if self.device is not None:
+            dev = "/GPU:0" if self.device == "gpu" else "/CPU:0"
+            with tf.device(dev):
+                return self.compute_output(X, training=training)
+        else:
+            return self.compute_output(X, training=training)
+
+    # Optional compatibility wrapper
+    def forward(self, X, training=True):
+        return self(X, training=training)
+
+    def compute_loss(self, y_pred, y_true):
+        """Custom loss method to avoid clashing with keras.Model.loss attribute."""
+        y_true = tf.cast(tf.reshape(y_true, (-1,)), tf.int32)
+        return self.loss_fn(y_true, y_pred)
+
+    def backward(self, X_train, y_train, optimizer):
+        with tf.GradientTape() as tape:
+            y_pred = self(X_train, training=True)
+            current_loss = self.compute_loss(y_pred, y_train)
+        grads = tape.gradient(current_loss, self.trainable_variables)
+        optimizer.apply_gradients(zip(grads, self.trainable_variables))
+        return current_loss
+
+
+# ----------------- Metrics helpers -----------------
+def accuracy_function(logits, true_y):
+    preds = tf.argmax(logits, axis=1, output_type=tf.int32)
+    true_y = tf.cast(tf.reshape(true_y, (-1,)), tf.int32)
+    correct = tf.equal(preds, true_y)
+    return tf.reduce_mean(tf.cast(correct, tf.float32))
+
+
+# ----------------- Training loop for each norm_type -----------------
+def train_model(norm_type, num_epochs=5):
+    print(f"\n==== Training with norm_type = {norm_type} ====")
+    print("Loading Fashion-MNIST...")
+    train_ds, test_ds, (x_train, y_train), (x_test, y_test) = load_fashion_mnist(batch_size)
+    print("Finished loading Fashion-MNIST.")
+
+    # Use CPU (device=None) to avoid GPU placement issues
+    model = CNN(hidden_size, output_size, norm_type=norm_type, device=None)
+    optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate)
+
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        num_batches = 0
+
+        for inputs, labels in train_ds:
+            loss_value = model.backward(inputs, labels, optimizer)
+            epoch_loss += float(loss_value.numpy())
+            num_batches += 1
+
+        avg_loss = epoch_loss / max(1, num_batches)
+
+        # Train / test accuracy
+        train_logits = model(x_train, training=False)
+        train_acc = float(accuracy_function(train_logits, y_train).numpy()) * 100.0
+
+        test_logits = model(x_test, training=False)
+        test_acc = float(accuracy_function(test_logits, y_test).numpy()) * 100.0
+
+        print(
+            f"Epoch {epoch + 1}: "
+            f"loss={avg_loss:.4f}, train_acc={train_acc:.2f}%, test_acc={test_acc:.2f}%"
+        )
+
+    return model
+
+
+# ----------------- (Optional) Comparison with TF's Norms -----------------
+def compare_batchnorm_with_tf(x):
+    """
+    x: sample activation (B, H, W, C)
+    Compares custom BN output with tf.nn.batch_normalization.
+    """
+    C = x.shape[-1]
+    gamma = tf.ones([1, 1, 1, C])
+    beta = tf.zeros([1, 1, 1, C])
+    eps = 1e-5
+
+    axes = [0, 1, 2]
+    mean = tf.reduce_mean(x, axis=axes, keepdims=True)
+    var = tf.reduce_mean(tf.square(x - mean), axis=axes, keepdims=True)
+
+    custom = batch_norm(x, gamma, beta, eps, training=True)
+    tf_bn = tf.nn.batch_normalization(x, mean, var, beta, gamma, eps)
+
+    diff = tf.reduce_max(tf.abs(custom - tf_bn))
+    print("Max abs difference (custom BN vs tf BN):", float(diff.numpy()))
+
+
+def compare_layernorm_with_tf(x):
+    """
+    x: sample activation (B, H, W, C)
+    Compares custom LN output with tf.keras.layers.LayerNormalization.
+    """
+    C = x.shape[-1]
+    gamma = tf.ones([1, 1, 1, C])
+    beta = tf.zeros([1, 1, 1, C])
+    eps = 1e-5
+
+    custom = layer_norm(x, gamma, beta, eps)
+
+    ln_layer = tf.keras.layers.LayerNormalization(
+        axis=[1, 2, 3], epsilon=eps, center=True, scale=True
+    )
+    _ = ln_layer(x)  # build
+    ln_layer.gamma.assign(tf.squeeze(gamma))
+    ln_layer.beta.assign(tf.squeeze(beta))
+
+    tf_ln = ln_layer(x)
+    diff = tf.reduce_max(tf.abs(custom - tf_ln))
+    print("Max abs difference (custom LN vs tf LN):", float(diff.numpy()))
+
+
+# ----------------- Main -----------------
+if __name__ == "__main__":
+    start = time.time()
+
+    # Quick run: all four norm types, 1 epoch each (bump epochs later for report)
+    for nt in ["none", "batch", "layer", "weight"]:
+        _ = train_model(nt, num_epochs=1)
+
+    print("Total time: {:.2f} sec".format(time.time() - start))
